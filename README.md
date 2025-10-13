@@ -66,6 +66,21 @@ Check out these articles to see how AlphaSuite can be used to develop and test s
 *   **Database**: PostgreSQL with SQLAlchemy
 *   **AI/LLM**: LangChain, Google Gemini, Ollama
 
+## 📂 Project Structure
+
+The project is organized into several key directories:
+
+*   `core/`: Contains the core application logic, including database setup (`db.py`), model definitions (`model.py`), and logging configuration.
+*   `pages/`: Each file in this directory corresponds to a page in the Streamlit web UI.
+*   `pybroker_trainer/`: Holds the machine learning pipeline for training and tuning trading models with `pybroker`.
+*   `strategies/`: Contains the definitions for different trading strategies. New strategies can be added here.
+*   `tools/`: Includes various utility modules for tasks like financial calculations, data scanning, and interacting with the `yfinance` API.
+*   `Home.py`: The main entry point for the Streamlit application.
+*   `download_data.py`: The command-line interface for all data management tasks.
+*   `quant_engine.py`: The core quantitative engine for backtesting and analysis.
+*   `requirements.txt`: A list of all the Python packages required to run the project.
+*   `.env.example`: An example file for environment variables.
+
 ## 🚀 Getting Started
 
 Follow these steps to set up and run AlphaSuite on your local machine.
@@ -140,6 +155,97 @@ Follow these steps to set up and run AlphaSuite on your local machine.
     3.  **Tune & Train:** To build custom models, navigate to the **Model Training & Tuning** page.
     4.  **Analyze & Backtest:** Use the **Portfolio Analysis** page to validate your strategies.
     5.  **Deep Research:** Use the **Stock Report** page for in-depth analysis of specific stocks.
+
+## 🧠 Adding a New Trading Strategy
+
+The quantitative engine is designed to be modular, allowing new trading strategies to be developed and integrated by simply adding a single, self-contained Python file to the `strategies/` directory. The system automatically discovers and loads any valid strategy file at runtime.
+
+### How It Works
+
+The system scans the `strategies/` directory for Python files. Inside each file, it looks for a class that inherits from `pybroker_trainer.strategy_sdk.BaseStrategy`. This class encapsulates all the logic and parameters for a single strategy. Two sample strategy files are included in the repository:
+ma_crossover.py is a non-ML, rule-based strategy; donchian_breakout.py is a ML-based strategy. You can use them as a reference for building your own.
+
+### Step-by-Step Guide
+
+1.  **Create a New File:** Create a new Python file in the `strategies/` directory. The filename should be descriptive and use snake_case (e.g., `my_awesome_strategy.py`).
+2.  **Define the Strategy Class:** Inside the new file, define a class that inherits from `BaseStrategy`. The class name should be descriptive and use CamelCase (e.g., `MyAwesomeStrategy`).
+3.  **Implement Required Methods:** Implement the four required methods within your class: `define_parameters`, `get_feature_list`, `add_strategy_specific_features`, and `get_setup_mask`.
+
+### Strategy Class Breakdown
+
+Each strategy class must implement the following methods, which define its behavior, data requirements, and entry logic.
+
+#### 1. `define_parameters()`
+
+This static method defines all the parameters the strategy uses, their default values, and their tuning ranges for optimization. This is critical for backtesting and hyperparameter tuning.
+
+*   **Returns:** A dictionary where each key is a parameter name. The value is another dictionary specifying its `type`, `default` value, and a `tuning_range` tuple.
+
+**Example from `DonchianBreakoutStrategy`:**
+```python
+@staticmethod
+def define_parameters():
+    """Defines parameters, their types, defaults, and tuning ranges."""
+    return {
+        'donchian_period': {'type': 'int', 'default': 20, 'tuning_range': (15, 50)},
+        'atr_period': {'type': 'int', 'default': 14, 'tuning_range': (10, 30)},
+        # ... other parameters
+    }
+```
+
+#### 2. `get_feature_list()`
+
+This method returns a list of all the feature (column) names that the strategy's machine learning model requires as input. The training engine uses this list to prepare the data correctly.
+
+*   **Returns:** A `list` of strings.
+
+**Example from `DonchianBreakoutStrategy`:**
+```python
+def get_feature_list(self) -> list[str]:
+    """Returns the list of feature column names required by the model."""
+    return [
+        'roc', 'rsi', 'mom', 'ppo', 'cci',
+        # ... other features
+    ]
+```
+
+#### 3. `add_strategy_specific_features()`
+
+This is where you calculate any indicators or features that are unique to your strategy and are not part of the common features provided by the system.
+
+*   **Arguments:** A pandas `DataFrame` containing the price data and common indicators.
+*   **Returns:** The modified pandas `DataFrame` with your new feature columns added.
+
+**Example from `DonchianBreakoutStrategy`:**
+```python
+def add_strategy_specific_features(self, data: pd.DataFrame) -> pd.DataFrame:
+    """Calculates and adds features unique to this specific strategy."""
+    donchian_period = self.params.get('donchian_period', 20)
+    data['donchian_upper'] = data['high'].rolling(window=donchian_period).max()
+    data['donchian_lower'] = data['low'].rolling(window=donchian_period).min()
+    data['donchian_middle'] = (data['donchian_upper'] + data['donchian_lower']) / 2
+    return data
+```
+
+#### 4. `get_setup_mask()`
+
+This is the core of your strategy's entry logic. This method must return a boolean pandas `Series` that is `True` on the bars where a potential trade setup occurs and `False` otherwise.
+
+*   **Arguments:** A pandas `DataFrame` containing all required features (both common and strategy-specific).
+*   **Returns:** A pandas `Series` of boolean values, with the same index as the input `DataFrame`.
+
+**Example from `DonchianBreakoutStrategy`:**
+```python
+def get_setup_mask(self, data: pd.DataFrame) -> pd.Series:
+    """Returns a boolean Series indicating the bars where a trade setup occurs."""
+    is_uptrend = data['trend_bullish'] == 1
+    is_breakout = data['high'] > data['donchian_upper'].shift(1)
+    raw_setup_mask = is_uptrend & is_breakout
+    # Ensure we only signal on the first bar of a new setup
+    return raw_setup_mask & ~raw_setup_mask.shift(1).fillna(False)
+```
+
+By following this structure, you can create new, complex strategies that seamlessly integrate with the project's backtesting, tuning, and training infrastructure.
 
 ## ⚖️ License
 
