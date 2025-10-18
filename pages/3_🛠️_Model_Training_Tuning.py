@@ -8,11 +8,12 @@ import queue
 import time
 
 from load_cfg import DEMO_MODE
-from pybroker_trainer.strategy_loader import get_strategy_class_map
+from pybroker_trainer.strategy_loader import get_strategy_class_map, get_strategy_defaults, load_strategy_class
 from quant_engine import (
     run_pybroker_walkforward,
     run_tune_strategy,
-    run_visualize_model
+    run_visualize_model,
+    run_quick_test
 )
 
 st.set_page_config(page_title="Model Training & Tuning", layout="wide")
@@ -30,10 +31,14 @@ if 'tuning_in_progress' not in st.session_state:
     st.session_state.tuning_in_progress = False
 if 'training_in_progress' not in st.session_state:
     st.session_state.training_in_progress = False
+if 'quick_test_in_progress' not in st.session_state:
+    st.session_state.quick_test_in_progress = False
 if 'tuning_thread' not in st.session_state:
     st.session_state.tuning_thread = None
 if 'training_thread' not in st.session_state:
     st.session_state.training_thread = None
+if 'quick_test_thread' not in st.session_state:
+    st.session_state.quick_test_thread = None
 if 'log_queue' not in st.session_state:
     st.session_state.log_queue = None
 if 'progress_queue' not in st.session_state:
@@ -46,6 +51,8 @@ if 'completion_message_tune' not in st.session_state:
     st.session_state.completion_message_tune = None
 if 'completion_message_train' not in st.session_state:
     st.session_state.completion_message_train = None
+if 'quick_test_results' not in st.session_state:
+    st.session_state.quick_test_results = None
 
 def run_tuning_in_thread(params, log_q, progress_q, stop_event):
     """Wrapper to run the tuning process in a separate thread and communicate via queues."""
@@ -79,13 +86,15 @@ def run_tuning_in_thread(params, log_q, progress_q, stop_event):
 
 st.markdown("""
 This page provides a user interface for the core backend commands.
+- **Quick Test:** Run a single, non-walk-forward backtest with custom parameters to quickly test strategy rules. For ML strategies, this uses a pass-through model to validate setups.
 - **Tune Strategy:** Use Bayesian Optimization to find the best high-level parameters for a strategy (e.g., stop-loss multipliers, indicator periods).
 - **Train Model:** Run a full walk-forward backtest. This process trains and tests a model on different time windows and saves the final trained model and its performance metrics.
+- **Visualize Model Performance:** Load and analyze the results of a completed training run, including out-of-sample equity curves, trade charts, and feature importances.
 """)
 
 strategy_options = list(get_strategy_class_map().keys())
 
-tune_tab, train_tab, visualize_tab = st.tabs(["Tune Strategy", "Train Model", "Visualize Model Performance"])
+quick_test_tab, tune_tab, train_tab, visualize_tab = st.tabs(["Quick Test", "Tune Strategy", "Train Model", "Visualize Model Performance"])
 
 with tune_tab:
     st.header("Tune Strategy Parameters")
@@ -306,6 +315,129 @@ with train_tab:
             st.session_state.log_messages = []
             st.rerun()
 
+def run_quick_test_in_thread(params, log_q, stop_event):
+    """Wrapper to run the quick test process in a separate thread."""
+    qh = logging.handlers.QueueHandler(log_q)
+    formatter = logging.Formatter("[%(asctime)s] %(levelname)s: %(message)s", datefmt='%H:%M:%S')
+    qh.setFormatter(formatter)
+    root_logger = logging.getLogger()
+    root_logger.addHandler(qh)
+    try:
+        results = run_quick_test(
+            ticker=params['ticker'],
+            strategy_type=params['strategy_type'],
+            start_date=params['start_date'].strftime('%Y-%m-%d'),
+            end_date=params['end_date'].strftime('%Y-%m-%d'),
+            strategy_params=params['strategy_params'],
+            commission_cost=params['commission'],
+            stop_event_checker=lambda: stop_event.is_set()
+        )
+        # Use the log queue to pass back the result
+        log_q.put(results)
+    finally:
+        root_logger.removeHandler(qh)
+
+with quick_test_tab:
+    st.header("Quick Test Strategy Rules")
+
+    if st.session_state.quick_test_results:
+        st.success("Quick Test complete!")
+        results = st.session_state.quick_test_results
+        st.subheader("Backtest Performance Metrics")
+        st.dataframe(results["metrics_df"])
+        st.subheader("Equity Curve")
+        if results.get("performance_fig"): st.pyplot(results["performance_fig"])
+        st.subheader("Trade Executions")
+        if results.get("trades_fig"): st.pyplot(results["trades_fig"])
+        with st.expander("View Detailed Trades"):
+            st.dataframe(results["trades_df"])
+        if st.button("Run New Quick Test", use_container_width=True):
+            st.session_state.quick_test_results = None
+            st.rerun()
+
+    elif not st.session_state.quick_test_in_progress:
+        # --- FIX: Move the interactive widget outside the form ---
+        # The strategy selection must be outside the form to allow its on_change
+        # callback (or in this case, its natural rerun behavior) to update other elements.
+        strategy_type_qt = st.selectbox(
+            "Select Strategy", strategy_options, key="qt_strat_select"
+        )
+
+        # Calculate the default params based on the selection above.
+        default_params_json = "{}"
+        if strategy_type_qt:
+            import json
+            strategy_class = load_strategy_class(strategy_type_qt)
+            if strategy_class:
+                default_params = get_strategy_defaults(strategy_class)
+                default_params_json = json.dumps(default_params, indent=4)
+
+        with st.form("quick_test_form"):
+            c1, c2 = st.columns(2)
+            ticker_qt = c1.text_input("Ticker", "SPY", key="qt_ticker").upper()
+            commission_qt = c2.number_input("Commission ($ per share)", value=0.0, format="%.4f", key="qt_comm")
+
+            c1, c2 = st.columns(2)
+            start_date_qt = c1.date_input("Start Date", datetime(2000, 1, 1), key="qt_start")
+            end_date_qt = c2.date_input("End Date", datetime.now(), key="qt_end")
+
+            st.markdown("###### Override Strategy Parameters (JSON format)")
+            params_override_text = st.text_area("Parameters", value=default_params_json, height=250, help="Enter a JSON object of parameters to override strategy defaults.")
+
+            run_qt = st.form_submit_button("Run Quick Test", use_container_width=True)
+
+            if run_qt:
+                import json
+                try:
+                    params_override = json.loads(params_override_text)
+                    st.session_state.quick_test_in_progress = True
+                    st.session_state.quick_test_params = {
+                        "ticker": ticker_qt, "strategy_type": st.session_state.qt_strat_select, "commission": commission_qt,
+                        "start_date": start_date_qt, "end_date": end_date_qt,
+                        "strategy_params": params_override
+                    }
+                    st.rerun()
+                except json.JSONDecodeError:
+                    st.error("Invalid JSON in parameters override text area.")
+
+    if st.session_state.quick_test_in_progress:
+        if st.session_state.quick_test_thread is None:
+            st.session_state.log_queue = queue.Queue()
+            st.session_state.log_messages = []
+            st.session_state.stop_event = threading.Event()
+            thread = threading.Thread(target=run_quick_test_in_thread, args=(st.session_state.quick_test_params, st.session_state.log_queue, st.session_state.stop_event), daemon=True)
+            st.session_state.quick_test_thread = thread
+            thread.start()
+
+        if st.button("Stop Quick Test", use_container_width=True, type="primary"):
+            if st.session_state.stop_event: st.session_state.stop_event.set()
+            st.warning("Stop signal sent. The process will halt.")
+
+        params = st.session_state.quick_test_params
+        st.info(f"Quick Test in progress for {params['ticker']} with {params['strategy_type']}...")
+        log_container = st.expander("Live Log", expanded=True)
+        log_area = log_container.empty()
+
+        final_result = None
+        while not st.session_state.log_queue.empty():
+            msg = st.session_state.log_queue.get()
+            if isinstance(msg, dict): final_result = msg
+            # Handle LogRecord objects, ignoring others (like None)
+            elif isinstance(msg, logging.LogRecord):
+                st.session_state.log_messages.append(msg.getMessage())
+        log_area.code("\n".join(st.session_state.log_messages[-150:]))
+
+        if st.session_state.quick_test_thread and st.session_state.quick_test_thread.is_alive():
+            time.sleep(1); st.rerun()
+        else:
+            st.session_state.quick_test_results = final_result
+            st.session_state.quick_test_in_progress = False
+            st.session_state.quick_test_thread = None
+            st.session_state.log_queue = None
+            st.session_state.stop_event = None
+            st.session_state.log_messages = []
+            st.rerun()
+
 with visualize_tab:
     st.header("Visualize Trained Model Performance")
     st.markdown("Load the saved artifacts from a `train` run to visualize its out-of-sample performance, trade executions, and feature importances.")
@@ -388,7 +520,7 @@ with visualize_tab:
         st.dataframe(results["metrics_df"])
 
         st.subheader("Walk-Forward Equity Curve")
-        if results.get("equity_fig"): st.pyplot(results["equity_fig"])
+        if results.get("performance_fig"): st.pyplot(results["performance_fig"])
 
         st.subheader("Trade Executions on Price Chart")
         if results.get("trades_fig"): st.pyplot(results["trades_fig"])

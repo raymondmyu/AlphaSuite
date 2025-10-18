@@ -42,7 +42,7 @@ import json
 import pickle
 import click
 from datetime import datetime, timedelta
-from dataclasses import asdict
+from dataclasses import asdict, replace
 
 import matplotlib.pyplot as plt
 import traceback
@@ -141,7 +141,8 @@ def _prepare_base_data(ticker: str, start_date: str, end_date: str, strategy_par
     
     data_df = _load_price_data(ticker, start_date, end_date)
     if data_df.empty:
-        raise ValueError(f"No data found for {ticker} between {start_date} and {end_date}")
+        logger.error(f"No data found for {ticker} between {start_date} and {end_date}. Returning empty DataFrame.")
+        return pd.DataFrame()
 
     # Calculate Buy-and-Hold Performance for the period
     if not data_df.empty:
@@ -198,29 +199,153 @@ def _prepare_base_data(ticker: str, start_date: str, end_date: str, strategy_par
     df_formatted['close'] = df_formatted['adjclose']
     return df_formatted
 
-def plot_equity_curve(result: TestResult, title: str) -> Optional[plt.Figure]:
+def _calculate_drawdown(series: pd.Series) -> pd.Series:
+    """Calculates the drawdown for a given time series of values."""
+    # Calculate the running maximum
+    cumulative_max = series.cummax()
+    # Calculate drawdown as the percentage drop from the running maximum
+    drawdown = (series - cumulative_max) / cumulative_max
+    return drawdown * 100  # Return as a percentage
+
+def plot_performance_vs_benchmark(result: TestResult, title: str, ticker: Optional[str] = None) -> Optional[plt.Figure]:
     """
-    Plots the portfolio equity curve from a pybroker TestResult object.
+    Generates a plot to analyze strategy performance.
+
+    If a benchmark ticker is provided, it generates a three-panel plot comparing
+    the strategy to the benchmark (equity, relative performance, and drawdown).
+
+    If no benchmark ticker is provided (e.g., for portfolio backtests), it plots
+    a simple equity curve of the strategy.
+
     Returns the matplotlib Figure object.
     """
     if not hasattr(result, 'portfolio') or result.portfolio.empty:
         logger.warning("No portfolio data found in results to plot.")
         return None
-
     portfolio_df = result.portfolio
-
     if 'market_value' not in portfolio_df.columns:
         logger.warning("Portfolio DataFrame is missing 'market_value' column.")
         return None
 
-    fig, ax = plt.subplots(figsize=(15, 7))
-    portfolio_df['market_value'].plot(ax=ax, label='Portfolio Value')
-    ax.set_title(title)
-    ax.set_xlabel('Date')
-    ax.set_ylabel('Portfolio Value ($)')
-    ax.legend()
-    ax.grid(True)
+    # --- Prepare Benchmark Data ---
+    benchmark_ticker = ticker
+    
+    normalized_benchmark = None
+    if benchmark_ticker:
+        start_date = result.start_date.strftime('%Y-%m-%d')
+        end_date = result.end_date.strftime('%Y-%m-%d')
+        logger.info(f"Loading benchmark data for {benchmark_ticker}...")
+        data_dict = load_ticker_data(benchmark_ticker, start_date, end_date)
+        if data_dict and 'shareprices' in data_dict and not data_dict['shareprices'].empty:
+            price_data = data_dict['shareprices']
+            initial_capital = portfolio_df['market_value'].iloc[0]
+            benchmark_series = price_data['Adj Close']
+            portfolio_dates = portfolio_df.index
+            benchmark_series = benchmark_series.reindex(portfolio_dates, method='ffill').dropna()
+            if not benchmark_series.empty:
+                normalized_benchmark = (benchmark_series / benchmark_series.iloc[0]) * initial_capital
+            else:
+                logger.warning(f"Benchmark data for {benchmark_ticker} could not be aligned with portfolio dates.")
+        else:
+            logger.warning(f"Could not load benchmark data for {benchmark_ticker}.")
+
+    # --- Create Plots ---
+    # If no benchmark is available, plot a simple equity curve.
+    if normalized_benchmark is None:
+        fig, ax = plt.subplots(figsize=(15, 7))
+        portfolio_df['market_value'].plot(ax=ax, label='Strategy Equity')
+        ax.set_title(title)
+        ax.set_ylabel('Portfolio Value ($)')
+        ax.set_xlabel('Date')
+        ax.legend()
+        ax.grid(True)
+        plt.tight_layout()
+        return fig
+
+    # If a benchmark is available, create the full 3-panel comparison plot.
+    fig, (ax1, ax2, ax3) = plt.subplots(3, 1, figsize=(15, 12), sharex=True,
+                                     gridspec_kw={'height_ratios': [3, 1, 2]})
+    fig.suptitle(title, fontsize=16)
+
+    # Top plot: Equity Curve vs. Benchmark
+    portfolio_df['market_value'].plot(ax=ax1, label='Strategy Equity')
+    normalized_benchmark.plot(ax=ax1, label=f'Buy & Hold {benchmark_ticker}', linestyle='--', color='gray')
+    ax1.set_ylabel('Portfolio Value ($)')
+    ax1.grid(True)
+    ax1.legend()
+
+    # Middle plot: Relative Performance Ratio
+    relative_performance = portfolio_df['market_value'] / normalized_benchmark
+    relative_performance.plot(ax=ax2, label='Relative Performance (Strategy / Benchmark)', color='purple')
+    ax2.axhline(1, color='black', linestyle='--', linewidth=1)
+    ax2.set_ylabel('Ratio')
+    ax2.grid(True, which='both', linestyle='--', linewidth=0.5)
+    ax2.legend()
+
+    # Third plot: Underwater (Drawdown)
+    strategy_drawdown = _calculate_drawdown(portfolio_df['market_value'])
+    strategy_drawdown.plot(ax=ax3, label='Strategy Drawdown', color='red')
+    ax3.fill_between(strategy_drawdown.index, strategy_drawdown, 0, color='red', alpha=0.3)
+
+    benchmark_drawdown = _calculate_drawdown(normalized_benchmark)
+    benchmark_drawdown.plot(ax=ax3, label=f'Benchmark Drawdown ({benchmark_ticker})', color='gray', linestyle='--')
+
+    ax3.set_ylabel('Drawdown (%)')
+    ax3.axhline(0, color='black', linestyle='-', linewidth=1)
+    ax3.grid(True, which='both', linestyle='--', linewidth=0.5)
+    ax3.legend()
+
+    ax3.set_xlabel('Date')
+    plt.tight_layout(rect=[0, 0.03, 1, 0.97])
     return fig
+
+def prepare_metrics_df_for_display(metrics_df: pd.DataFrame, timeframe: str = '1d') -> pd.DataFrame:
+    """
+    Prepares the pybroker metrics DataFrame for display by annualizing key ratios.
+
+    Args:
+        metrics_df: The raw metrics_df from a TestResult.
+        timeframe: The timeframe of the backtest data (e.g., '1d', '1h').
+
+    Returns:
+        A new DataFrame with annualized Sharpe and Sortino ratios.
+    """
+    display_df = metrics_df.copy()
+
+    sharpe_mask = display_df['name'] == 'sharpe'
+    if sharpe_mask.any():
+        original_sharpe = float(display_df.loc[sharpe_mask, 'value'].iloc[0])
+        display_df.loc[sharpe_mask, 'value'] = _calculate_annualized_ratio(original_sharpe, timeframe)
+    
+    sortino_mask = display_df['name'] == 'sortino'
+    if sortino_mask.any():
+        original_sortino = float(display_df.loc[sortino_mask, 'value'].iloc[0])
+        display_df.loc[sortino_mask, 'value'] = _calculate_annualized_ratio(original_sortino, timeframe)
+        
+    for col in display_df.columns:
+        if display_df[col].dtype == 'object':
+            display_df[col] = display_df[col].astype(str)
+    return display_df
+
+def _calculate_annualized_ratio(daily_ratio: float | None, timeframe: str = '1d') -> float | None:
+    """
+    Annualizes a daily risk-adjusted return ratio (like Sharpe or Sortino).
+
+    Args:
+        daily_ratio: The raw, per-period ratio from pybroker metrics.
+        timeframe: The timeframe of the backtest data (e.g., '1d', '1h').
+
+    Returns:
+        The annualized ratio, or None if it cannot be calculated.
+    """
+    if daily_ratio is None:
+        return None
+    
+    # Assuming 252 trading days, 252 * 6.5 trading hours for '1h', etc.
+    # This is a simplification but standard practice.
+    annualization_factors = {'1d': 252, '1h': 252 * 7, '30m': 252 * 13, '15m': 252 * 26}
+    factor = annualization_factors.get(timeframe, 252) # Default to daily
+    return float(daily_ratio * np.sqrt(factor))
 
 def plot_trades_on_chart(result: TestResult, ticker: str, title: str) -> Optional[plt.Figure]:
     """
@@ -352,14 +477,21 @@ def run_visualize_model(ticker: str, strategy_type: str) -> Optional[Dict]:
     if os.path.exists(strategy_params_filename):
         with open(strategy_params_filename, 'r') as f: best_strategy_params = json.load(f)
 
-    # --- Clean DataFrames for Streamlit/Arrow compatibility ---
-    # This prevents serialization errors when displaying the DataFrame in the UI.
-    # If a column has mixed types (e.g., numbers and strings), pyarrow can fail.
-    # Forcing object columns to string is the safest way to ensure they display correctly.
-    metrics_df = result.metrics_df.copy()
-    for col in metrics_df.columns:
-        if metrics_df[col].dtype == 'object':
-            metrics_df[col] = metrics_df[col].astype(str)
+    # --- Check for the annualization flag in the correct file ---
+    # The flag is saved in `_best_strategy_params.json` during a tune run,
+    # and in `_strategy_params.json` during a regular train run. We need to check both.
+    params_to_check = best_strategy_params
+    if not params_to_check:
+        # Fallback to the regular strategy params file if the 'best' one doesn't exist
+        regular_params_filename = os.path.join(model_dir, f'{ticker}_{strategy_type}_strategy_params.json')
+        if os.path.exists(regular_params_filename):
+            with open(regular_params_filename, 'r') as f: params_to_check = json.load(f)
+
+    if params_to_check and params_to_check.get('ratios_annualized'):
+        metrics_df = result.metrics_df  # Ratios are already annualized.
+    else:
+        metrics_df = prepare_metrics_df_for_display(result.metrics_df, '1d') # Legacy file, annualize on-the-fly.
+
     trades_df = result.trades.copy()
     for col in trades_df.columns:
         if trades_df[col].dtype == 'object':
@@ -373,7 +505,7 @@ def run_visualize_model(ticker: str, strategy_type: str) -> Optional[Dict]:
     return {
         "metrics_df": metrics_df,
         "trades_df": trades_df,
-        "equity_fig": plot_equity_curve(result, f'Walk-Forward Equity for {ticker} ({strategy_type})'),
+        "performance_fig": plot_performance_vs_benchmark(result, f'Walk-Forward Performance for {ticker} ({strategy_type})'),
         "trades_fig": plot_trades_on_chart(result, ticker, f'Trades for {ticker} ({strategy_type})'),
         "importance_fig": importance_fig,
         "best_model_params": best_model_params,
@@ -620,7 +752,23 @@ def run_pybroker_walkforward(ticker: str = 'SPY', start_date: str = '2000-01-01'
             if 'target' in train_data.columns:
                 train_data = train_data.dropna(subset=['target'])
 
-            # --- NEW: More robust check for minimum samples per fold ---
+            # --- Apply embargo to prevent data leakage from future information ---
+            # The embargo period is based on the `target_eval_bars` or `stop_out_window`
+            # parameter, which defines how many bars into the future the target is calculated.
+            # We remove data points from the end of the training set that would overlap
+            # with the target calculation window of the test set.
+            # This is crucial for preventing look-ahead bias in walk-forward validation.
+            if not train_data.empty:
+                eval_bars = strategy_instance.params.get('target_eval_bars')
+                if eval_bars is None:
+                    eval_bars = strategy_instance.params.get('stop_out_window', 15) # Default to 15 if neither is found
+                last_train_date = train_data['date'].max()
+                embargo_start_date = last_train_date - pd.Timedelta(days=eval_bars * 1.5) # Use 1.5 for a safety margin
+                original_len = len(train_data)
+                train_data = train_data[train_data['date'] < embargo_start_date]
+                logger.info(f"[{symbol}] Applied embargo: Purged {original_len - len(train_data)} samples from the end of the training set.")
+
+            # --- More robust check for minimum samples per fold ---
             min_total_samples = 30  # Increased minimum total setups required for training
             min_class_samples = 10  # Minimum required setups for EACH class (win and loss)
 
@@ -800,10 +948,18 @@ def run_pybroker_walkforward(ticker: str = 'SPY', start_date: str = '2000-01-01'
             warmup=2,
         )
 
+        # --- Annualize Sharpe and Sortino Ratios ---
+        if result and hasattr(result, 'metrics') and hasattr(result, 'metrics_df'):
+            # The result object is immutable. We create a new object with the annualized metrics_df.
+            display_metrics_df = prepare_metrics_df_for_display(result.metrics_df, '1d')
+            savable_result = replace(result, metrics_df=display_metrics_df)
+        else:
+            savable_result = result # Fallback if result is None or malformed
+            
         if stop_event_checker and stop_event_checker():
             logger.warning("Stop event detected during pybroker walkforward. Results may be incomplete.")
             # Return whatever result we have, but don't save assets.
-            return result, all_quality_scores
+            return savable_result, all_quality_scores
 
         if save_assets:
             if stop_event_checker and stop_event_checker():
@@ -813,7 +969,7 @@ def run_pybroker_walkforward(ticker: str = 'SPY', start_date: str = '2000-01-01'
             _save_walkforward_artifacts(
                 ticker=ticker,
                 strategy_type=strategy_type,
-                result=result,
+                result=savable_result, # Save the object with the annualized metrics
                 is_ml=is_ml,
                 last_trained_model=last_trained_model,
                 features=features,
@@ -825,9 +981,9 @@ def run_pybroker_walkforward(ticker: str = 'SPY', start_date: str = '2000-01-01'
 
         logger.info(f"\n--- Walk-Forward Analysis Results for {ticker} with {strategy_type} strategy ---")
         logger.info("NOTE: These metrics are calculated on out-of-sample test windows only, providing a more realistic performance estimate.")
-        logger.info(result.metrics_df.to_string())
+        logger.info(display_metrics_df.to_string() if 'display_metrics_df' in locals() else result.metrics_df.to_string())
         if plot_results:
-            fig_equity = plot_equity_curve(result, f'Walk-Forward Equity Curve for {ticker}')
+            fig_equity = plot_performance_vs_benchmark(result, f'Walk-Forward Equity Curve for {ticker}')
             if fig_equity: 
                 plt.show()
             if all_feature_importances:
@@ -863,7 +1019,10 @@ def _save_walkforward_artifacts(ticker, strategy_type, result, is_ml, last_train
     # 2. Save the strategy parameters used for the run
     strategy_params_filename = os.path.join(model_dir, f'{ticker}_{strategy_type}_strategy_params.json')
     with open(strategy_params_filename, 'w') as f:
-        json.dump(strategy_params, f, indent=4, cls=NumpyEncoder)
+        # --- Add a versioning flag to indicate ratios are annualized ---
+        params_to_save = strategy_params.copy()
+        params_to_save['ratios_annualized'] = True
+        json.dump(params_to_save, f, indent=4, cls=NumpyEncoder)
     logger.info(f"Saved strategy parameters to {strategy_params_filename}")
 
     # --- Save ML-specific artifacts only if applicable ---
@@ -1112,14 +1271,10 @@ def visualize_model(ticker, strategy_type, plot):
     if not viz_assets:
         logger.error("Visualization failed to produce assets.")
         return
-
-    # --- Print metrics and parameters to the console ---
-    logger.info(f"\n--- Walk-Forward Performance Metrics for {ticker} - {strategy_type} ---")
-    print(viz_assets["metrics_df"].to_string())
-
+    
     if viz_assets.get("best_strategy_params"):
         logger.info("\n--- Tuned Strategy Parameters ---")
-        print(json.dumps(viz_assets["best_strategy_params"], indent=2))
+        logger.info(json.dumps(viz_assets["best_strategy_params"], indent=2))
     
     if viz_assets.get("best_model_params"):
         logger.info("\n--- Tuned Model Hyperparameters (from last fold) ---")
@@ -1318,7 +1473,10 @@ def run_tune_strategy(ticker, strategy_type, n_calls, start_date, end_date, comm
     os.makedirs(model_dir, exist_ok=True)
     tuned_params_filename = os.path.join(model_dir, f'{ticker}_{strategy_type}_best_strategy_params.json')
     with open(tuned_params_filename, 'w') as f:
-        json.dump(best_params_dict, f, indent=4, cls=NumpyEncoder)
+        # --- Add the versioning flag to the best params file ---
+        params_to_save = best_params_dict.copy()
+        params_to_save['ratios_annualized'] = True
+        json.dump(params_to_save, f, indent=4, cls=NumpyEncoder)
     logger.info(f"Saved best strategy parameters to {tuned_params_filename}")
 
     # --- Re-run the final backtest with the best parameters to save the results ---
@@ -1450,9 +1608,18 @@ def run_pybroker_full_backtest(ticker: str = 'SPY', start_date: str = '2000-01-0
         min_train_size = 2 / (len(data_df) - 2) if len(data_df) > 2 else 0.99
         result = strategy.walkforward(windows=1, train_size=min_train_size)
 
+        # --- Annualize Sharpe and Sortino Ratios ---
+        if result and hasattr(result, 'metrics') and hasattr(result, 'metrics_df'):
+            # The result object is immutable. We create a new object with the annualized metrics_df
+            # to ensure the returned artifact is in its final, display-ready state.
+            display_metrics_df = prepare_metrics_df_for_display(result.metrics_df, '1d')
+            savable_result = replace(result, metrics_df=display_metrics_df)
+        else:
+            savable_result = result
+
         # --- Step 6: Display results ---
         return {
-            'result': result,
+            'result': savable_result, # Return the object with the annualized metrics
             'features': features,
             'model': model
         }
@@ -1467,7 +1634,112 @@ def run_pybroker_full_backtest(ticker: str = 'SPY', start_date: str = '2000-01-0
             pybroker.unregister_columns(features)
         if context_columns_to_register:
             pybroker.unregister_columns(context_columns_to_register)
-    return None
+
+def run_quick_test(ticker: str, strategy_type: str, start_date: str, end_date: str, strategy_params: dict, commission_cost: float, stop_event_checker=None) -> Optional[dict]:
+    """
+    Runs a full, in-sample backtest using a pre-trained model saved by the 'train' command.
+    This function loads the saved model and its associated parameters, then runs a backtest
+    over the specified historical period.
+    Returns a dictionary of backtest artifacts (result, features, model).
+    """
+    features: list[str] = []
+    context_columns_to_register: list[str] = []
+    model_dir = os.path.join('pybroker_trainer', 'artifacts')
+
+    try:
+        if stop_event_checker and stop_event_checker(): return None
+
+        strategy_class = load_strategy_class(strategy_type)
+        if not strategy_class:
+            logger.error(f"Could not load strategy class for {strategy_type}. Aborting.")
+            return None
+        
+        # Start with defaults and apply overrides from UI
+        base_params = get_strategy_defaults(strategy_class)
+        base_params.update(strategy_params)
+
+        strategy_instance = strategy_class(params=base_params)
+        is_ml = strategy_instance.is_ml_strategy
+        
+        base_df = _prepare_base_data(ticker, start_date, end_date, base_params)
+        data_df = strategy_instance.prepare_data(data=base_df)
+        features = strategy_instance.get_feature_list()
+        context_columns_to_register = BASE_CONTEXT_COLUMNS + strategy_instance.get_extra_context_columns_to_register()
+        
+        if data_df.empty:
+            logger.error(f"No data available for {ticker} in the specified range. Aborting.")
+            return None
+
+        if is_ml:
+            pybroker.register_columns(features)
+        pybroker.register_columns(context_columns_to_register)
+        pybroker.disable_logging()
+
+        model_name = 'quick_test_model'
+        model_source = None
+        if is_ml:
+            model_config = strategy_instance.get_model_config()
+            pass_through_model = PassThroughModel(n_classes=model_config.get('num_class', 2))
+            model_bundle = {'model': pass_through_model, 'features': features}
+            def train_fn_dummy(symbol, train_data, test_data, **kwargs):
+                return model_bundle
+            def model_input_data_fn(data): 
+                return data[features]
+            model_source = pybroker.model(name=model_name, fn=train_fn_dummy, predict_fn=custom_predict_fn, input_data_fn=model_input_data_fn, pretrained=True)
+
+        strategy_config = StrategyConfig(
+            position_mode=PositionMode.LONG_ONLY, 
+            exit_on_last_bar=True,
+            fee_mode=pybroker.FeeMode.PER_SHARE if commission_cost > 0 else None,
+            fee_amount=commission_cost
+        )
+        trader = strategy_instance.get_trader(model_name if is_ml else None, {ticker: base_params})
+        strategy = Strategy(data_source=data_df, start_date=start_date, end_date=end_date, config=strategy_config)
+        if is_ml:
+            strategy.add_execution(trader.execute, [ticker], models=[model_source])
+        else:
+            strategy.add_execution(trader.execute, [ticker])
+
+        logger.info("Starting Quick Test backtest...")
+        if len(data_df) < 4:
+            logger.error(f"Not enough data ({len(data_df)} bars) to run a backtest. Minimum 4 required.")
+            return None
+        
+        # --- Use strategy.walkforward(windows=1) to run a single backtest ---
+        min_train_size = 2 / (len(data_df) - 2) if len(data_df) > 2 else 0.99
+        result = strategy.walkforward(windows=1, train_size=min_train_size)
+
+        # --- Annualize Sharpe and Sortino Ratios ---
+        if result and hasattr(result, 'metrics') and hasattr(result, 'metrics_df'):
+            # The result object is immutable. We create a separate, annualized version for display.
+            display_metrics_df = prepare_metrics_df_for_display(result.metrics_df, '1d')
+        else:
+            display_metrics_df = pd.DataFrame() # Handle case where backtest fails
+
+        if stop_event_checker and stop_event_checker():
+            logger.warning("Stop event detected during Quick Test. Results may be incomplete.")
+            return None
+
+        # Prepare trades dataframe for UI display
+        trades_df = result.trades.copy() if result else pd.DataFrame()
+
+        return {
+            "metrics_df": display_metrics_df,
+            "trades_df": trades_df,
+            "performance_fig": plot_performance_vs_benchmark(result, f'Quick Test Performance for {ticker} ({strategy_type})', ticker=ticker),
+            "trades_fig": plot_trades_on_chart(result, ticker, f'Quick Test Trades for {ticker} ({strategy_type})'),
+        }
+
+    except Exception as e:
+        logger.error(f"An error occurred during the full backtest for {ticker}: {e}")
+        traceback.print_exc()
+        return None
+    finally:
+        # Unregister columns to clean up global scope
+        if features:
+            pybroker.unregister_columns(features)
+        if context_columns_to_register:
+            pybroker.unregister_columns(context_columns_to_register)
 
 def run_pybroker_portfolio_backtest(tickers: list[str], strategy_type: str, start_date: str, end_date: str, plot_results: bool = True, use_tuned_strategy_params: bool = False, max_open_positions: int = 5, commission_cost: float = 0.0):
     """
@@ -1599,11 +1871,16 @@ def run_pybroker_portfolio_backtest(tickers: list[str], strategy_type: str, star
         windows = 4 if total_years >= 20 else 2 if total_years >= 10 else 1
         
         result = strategy.walkforward(windows=windows, train_size=0.7, lookahead=1, calc_bootstrap=True)
-
+        
+        # --- Annualize Sharpe and Sortino Ratios ---
+        if result and hasattr(result, 'metrics') and hasattr(result, 'metrics_df'):
+            # The result object is immutable. We create a separate, annualized version for display/logging.
+            display_metrics_df = prepare_metrics_df_for_display(result.metrics_df, '1d')
+            
         logger.info(f"\n--- Portfolio Walk-Forward Results for {strategy_type} strategy ---")
-        logger.info(result.metrics_df.to_string())
+        logger.info(display_metrics_df.to_string() if 'display_metrics_df' in locals() else result.metrics_df.to_string())
         if plot_results:
-            plot_equity_curve(result, f"Portfolio ({strategy_type})")
+            plot_performance_vs_benchmark(result, f"Portfolio Performance ({strategy_type})")
 
     except Exception as e:
         logger.error(f"An error occurred during the portfolio backtest: {e}")
