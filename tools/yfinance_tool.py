@@ -1067,13 +1067,20 @@ def _process_price_history_batches(db: Session, tickers: list, batch_size: int, 
                 company = db.query(Company).filter(Company.symbol == ticker).first()
                 if not company: continue
 
-                ticker_columns = [c for c in share_price_data.columns if c.startswith(ticker)]
+                # --- Robustly find columns for the current ticker ---
+                # This handles cases where a ticker in the batch might not have returned any data.
+                # The prefix is always "TICKER-", so we check for that.
+                ticker_prefix = f"{ticker}-"
+                ticker_columns = [c for c in share_price_data.columns if c.startswith(ticker_prefix)]
+
                 if not ticker_columns:
                     inactive_tickers.append(ticker)
-                    logger.info(f"No data found for {ticker} in share price data batch.")
                 else:
                     price_data = share_price_data[ticker_columns].copy()
-                    price_data.columns = [col.replace(f"-{ticker}", "") for col in price_data.columns]
+                    # Robustly remove the ticker prefix, which might be "TICKER-" or just "TICKER".
+                    # This handles both US stocks (e.g., "AAPL-Open") and international stocks (e.g., "ZUP.TO-Open").
+                    prefix_to_remove = f"{ticker}-"
+                    price_data.columns = [col.replace(prefix_to_remove, "") for col in price_data.columns]
                     if not price_data.empty:
                         batch_price_data[company.id] = price_data
             
@@ -1132,6 +1139,12 @@ def save_or_update_company_data(market="us", exchange=None, quote_types=["EQUITY
         if update_prices_action == 'last_day':
             start_date = (datetime.utcnow() - timedelta(days=1)).strftime('%Y-%m-%d')
         
+        # If end_date is today, set it to None to ensure today's data is included.
+        # yfinance's end_date is exclusive.
+        if end_date and datetime.strptime(end_date, '%Y-%m-%d').date() == datetime.utcnow().date():
+            logger.info("end_date is today. Setting to None to include today's price data.")
+            end_date = None
+
         _process_price_history_batches(db, tickers_to_process, batch_size, start_date, end_date)
 
     except Exception as e:
