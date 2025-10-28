@@ -143,7 +143,11 @@ Follow these steps to set up and run AlphaSuite on your local machine.
     *   For the **very first run** to populate your database:
         ```bash
 	python download_data.py init-db
-	python download_data.py scan
+        ```
+        ```bash
+        python download_data.py scan
+        ```
+        ```bash
         python download_data.py download 
         ```
     ```bash
