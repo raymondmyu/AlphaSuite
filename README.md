@@ -142,6 +142,8 @@ Follow these steps to set up and run AlphaSuite on your local machine.
     Before running the app, you need to populate the database with market data. Run the download script from your terminal. This may take a long time for the initial run.
     *   For the **very first run** to populate your database:
         ```bash
+	python download_data.py init-db
+	python download_data.py scan
         python download_data.py download 
         ```
     ```bash
