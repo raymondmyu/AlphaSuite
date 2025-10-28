@@ -1137,11 +1137,11 @@ def save_or_update_company_data(market="us", exchange=None, quote_types=["EQUITY
 
         # Step 3: Process price history
         if update_prices_action == 'last_day':
-            start_date = (datetime.utcnow() - timedelta(days=1)).strftime('%Y-%m-%d')
+            start_date = (datetime.now() - timedelta(days=1)).strftime('%Y-%m-%d')
         
-        # If end_date is today, set it to None to ensure today's data is included.
+        # If end_date is today or in the future, set it to None to ensure today's data is included.
         # yfinance's end_date is exclusive.
-        if end_date and datetime.strptime(end_date, '%Y-%m-%d').date() == datetime.utcnow().date():
+        if end_date and datetime.strptime(end_date, '%Y-%m-%d').date() == datetime.now().date():
             logger.info("end_date is today. Setting to None to include today's price data.")
             end_date = None
 
