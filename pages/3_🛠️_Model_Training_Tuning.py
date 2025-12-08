@@ -356,9 +356,6 @@ with quick_test_tab:
             st.rerun()
 
     elif not st.session_state.quick_test_in_progress:
-        # --- FIX: Move the interactive widget outside the form ---
-        # The strategy selection must be outside the form to allow its on_change
-        # callback (or in this case, its natural rerun behavior) to update other elements.
         strategy_type_qt = st.selectbox(
             "Select Strategy", strategy_options, key="qt_strat_select"
         )

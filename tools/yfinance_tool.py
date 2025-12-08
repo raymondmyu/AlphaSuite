@@ -1286,6 +1286,48 @@ def get_all_tickers_in_market(market: str = None, exchange: str = None, ticker_f
         logger.error(f"An unexpected error occurred in get_all_tickers_in_market: {e}", exc_info=True)
         return {"error": str(e)}
 
+def get_benchmark_ticker_for_asset(ticker: str) -> tuple[str, str]:
+    """
+    Dynamically determines the most appropriate market benchmark ETF for a given stock ticker
+    by looking up its sector. It provides a primary (sector-specific) and a secondary
+    (broad market) benchmark for fallback.
+
+    Args:
+        ticker: The stock ticker symbol.
+
+    Returns:
+        A tuple containing the primary benchmark ticker and the secondary benchmark ticker.
+    """
+    # Mapping from database sector names to their corresponding SPDR Select Sector ETFs.
+    # The secondary benchmark is always the S&P 500.
+    PRIMARY_BENCHMARK = '^SPX'
+    SECONDARY_BENCHMARK = '^SPX'
+
+    SECTOR_TO_ETF_MAP = {
+        "Technology": "XLK",
+        "Financial Services": "XLF",
+        "Healthcare": "XLV",
+        "Energy": "XLE",
+        "Industrials": "XLI",
+        "Consumer Cyclical": "XLY",      # Maps to Consumer Discretionary
+        "Consumer Defensive": "XLP",     # Maps to Consumer Staples
+        "Utilities": "XLU",
+        "Basic Materials": "XLB",
+        "Real Estate": "XLRE",
+        "Communication Services": "XLC",
+    }
+
+    db_session = next(get_db())
+    try:
+        company = db_session.query(Company).filter(Company.symbol == ticker).first()
+        if company and company.sector in SECTOR_TO_ETF_MAP:
+            # If a sector ETF is found, it becomes the primary benchmark.
+            PRIMARY_BENCHMARK = SECTOR_TO_ETF_MAP[company.sector]
+    finally:
+        db_session.close()
+    
+    return PRIMARY_BENCHMARK, SECONDARY_BENCHMARK
+
 
 # Create a dictionary to map ticker suffixes to exchanges (expand as needed)
 EXCHANGE_SUFFIX_MAP = {

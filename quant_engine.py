@@ -161,6 +161,9 @@ def _prepare_base_data(ticker: str, start_date: str, end_date: str, strategy_par
             month_dummies[f'month_{m}'] = 0
     data_df = pd.concat([data_df, month_dummies], axis=1)
     data_df.drop('month', axis=1, inplace=True)
+    # --- Add Turn-of-Month Seasonality Feature ---
+    data_df['day_of_month'] = data_df.index.day
+    data_df['is_turn_of_month'] = ((data_df['day_of_month'] >= 28) | (data_df['day_of_month'] <= 4)).astype(int)
 
     include_earnings_dates = strategy_params.get('include_earnings_dates', False)
     if include_earnings_dates:
@@ -417,17 +420,19 @@ def plot_feature_importance(feature_names, all_importances, top_n=20) -> Optiona
         'feature': feature_names,
         'importance': mean_importances,
         'std': std_importances
-    }).sort_values(by='importance', ascending=False)
+    }).sort_values(by='importance', ascending=True)
 
     # Plot the top N features
-    top_features_df = importance_df.head(top_n)
+    top_features_df = importance_df.tail(top_n)
+    # The log should show features from most to least important, so we reverse the list from the tail.
+    logger.info(f"Top {top_n} Feature Importances (most to least): {top_features_df['feature'].tolist()[::-1]}")
 
     fig, ax = plt.subplots(figsize=(12, 8))
     ax.barh(top_features_df['feature'], top_features_df['importance'], xerr=top_features_df['std'], align='center', capsize=5, color='skyblue', edgecolor='black', alpha=0.8)
     ax.set_xlabel('Mean Feature Importance (LGBM Gain)')
     ax.set_ylabel('Features')
     ax.set_title(f'Top {top_n} Feature Importances (Averaged Across Walk-Forward Folds)')
-    ax.invert_yaxis()  # Highest importance at the top
+    # With ascending sort and tail(), the most important is last, which barh plots at the top. No inversion needed.
     ax.grid(axis='x', linestyle='--', alpha=0.6)
     plt.tight_layout() # Adjust layout to make room for labels
     return fig
